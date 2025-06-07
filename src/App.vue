@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import HelloWorld from './components/HelloWorld.vue'
+import HelloWorld from './components/HelloWorld.vue';
+import SideNav from './components/SideNav.vue';
 </script>
 
 <template>
@@ -12,6 +13,7 @@ import HelloWorld from './components/HelloWorld.vue'
     </a>
   </div>
   <HelloWorld msg="Vite + Vue" />
+  <SideNav />
 </template>
 
 <style scoped>
