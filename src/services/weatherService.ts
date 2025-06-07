@@ -132,25 +132,128 @@ let userSelectedCity: string | null = null;
  * 尝试通过IP地址获取大概位置（备选方案）
  */
 async function getLocationByIP(): Promise<string> {
-  try {
-    console.log('🌐 尝试通过IP地址获取位置信息...');
-    // 使用免费的IP定位服务
-    const response = await fetch('https://ipapi.co/json/');
-    if (response.ok) {
-      const data = await response.json();
-      const city = data.city;
-      console.log(`🌐 IP定位获取到城市: ${city}`);
-      
-      // 尝试从映射表中找到对应的行政区划代码
-      const mappedCode = DISTRICT_CODE_MAP[city + '市'] || DISTRICT_CODE_MAP[city];
-      if (mappedCode) {
-        console.log(`✅ IP定位成功，使用城市: ${city}`);
-        return mappedCode;
+  // 定义多个IP定位服务，提高成功率
+  const ipServices = [
+    {
+      name: 'ipapi.co',
+      url: 'https://ipapi.co/json/',
+      getCityName: (data: any) => data.city
+    },
+    {
+      name: 'ip-api.com',
+      url: 'http://ip-api.com/json/',
+      getCityName: (data: any) => data.city
+    },
+    {
+      name: 'ipinfo.io',
+      url: 'https://ipinfo.io/json',
+      getCityName: (data: any) => data.city
+    }
+  ];
+
+  // 城市名称标准化函数
+  const normalizeCityName = (cityName: string): string[] => {
+    if (!cityName) return [];
+    
+    const normalized = cityName.trim();
+    const variations = [
+      normalized,
+      normalized + '市',
+      normalized.replace(/市$/, ''),
+      normalized.replace(/[市县区]$/, '') + '市'
+    ];
+    
+    // 处理一些特殊的城市名称映射
+    const specialMappings: Record<string, string[]> = {
+      'Beijing': ['北京', '北京市'],
+      'Shanghai': ['上海', '上海市'],
+      'Guangzhou': ['广州', '广州市'],
+      'Shenzhen': ['深圳', '深圳市'],
+      'Hangzhou': ['杭州', '杭州市'],
+      'Nanjing': ['南京', '南京市'],
+      'Wuhan': ['武汉', '武汉市'],
+      'Chengdu': ['成都', '成都市'],
+      'Chongqing': ['重庆', '重庆市'],
+      'Tianjin': ['天津', '天津市']
+    };
+    
+    if (specialMappings[normalized]) {
+      variations.push(...specialMappings[normalized]);
+    }
+    
+    return [...new Set(variations)];
+  };
+
+  // 在映射表中查找城市代码
+  const findCityCode = (cityName: string): string | null => {
+    const variations = normalizeCityName(cityName);
+    
+    for (const variation of variations) {
+      if (DISTRICT_CODE_MAP[variation]) {
+        console.log(`✅ 找到城市映射: ${cityName} -> ${variation} -> ${DISTRICT_CODE_MAP[variation]}`);
+        return DISTRICT_CODE_MAP[variation];
       }
     }
-  } catch (error) {
-    console.warn('⚠️ IP定位失败:', error);
+    
+    // 模糊匹配：查找包含该城市名的条目
+    const fuzzyMatch = Object.keys(DISTRICT_CODE_MAP).find(key => 
+      variations.some(v => key.includes(v) || v.includes(key.replace('市', '')))
+    );
+    
+    if (fuzzyMatch) {
+      console.log(`🔍 模糊匹配成功: ${cityName} -> ${fuzzyMatch} -> ${DISTRICT_CODE_MAP[fuzzyMatch]}`);
+      return DISTRICT_CODE_MAP[fuzzyMatch];
+    }
+    
+    return null;
+  };
+
+  // 尝试多个IP定位服务
+  for (const service of ipServices) {
+    try {
+      console.log(`🌐 尝试使用 ${service.name} 获取IP位置信息...`);
+      
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 5000); // 5秒超时
+      
+      const response = await fetch(service.url, {
+        signal: controller.signal,
+        headers: {
+          'Accept': 'application/json'
+        }
+      });
+      
+      clearTimeout(timeoutId);
+      
+      if (response.ok) {
+        const data = await response.json();
+        const cityName = service.getCityName(data);
+        
+        console.log(`🌐 ${service.name} 返回城市: ${cityName}`);
+        console.log(`🌐 完整响应数据:`, data);
+        
+        if (cityName) {
+          const cityCode = findCityCode(cityName);
+          if (cityCode) {
+            console.log(`✅ IP定位成功，使用城市: ${cityName} (${cityCode})`);
+            return cityCode;
+          } else {
+            console.warn(`⚠️ 未找到城市 "${cityName}" 的映射代码`);
+          }
+        }
+      } else {
+        console.warn(`⚠️ ${service.name} 请求失败:`, response.status, response.statusText);
+      }
+    } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') {
+        console.warn(`⏰ ${service.name} 请求超时`);
+      } else {
+        console.warn(`⚠️ ${service.name} 请求失败:`, error);
+      }
+    }
   }
+  
+  console.warn('❌ 所有IP定位服务都失败，回退到默认城市（北京）');
   return '110100'; // 最终回退到北京
 }
 
@@ -171,30 +274,46 @@ function getPopularCities(): Array<{name: string, code: string}> {
 }
 
 /**
- * 优化后的获取当前行政区划ID函数
- * 支持多种定位方式和用户交互
+ * 获取当前用户的位置信息（经纬度或行政区划ID）
+ * 优先级：用户偏好 > 本地存储 > GPS定位 > IP定位 > 默认北京
+ * 返回格式：{ type: 'location' | 'district_id', value: string }
  */
-async function getCurrentDistrictId(): Promise<string> {
-  // 如果用户之前手动选择过城市，优先使用
+export async function getCurrentLocationInfo(): Promise<{ type: 'location' | 'district_id', value: string }> {
+  console.log('🎯 开始获取当前位置信息...');
+  
+  // 1. 检查用户手动设置的城市
   if (userSelectedCity) {
-    console.log(`🎯 使用用户选择的城市: ${userSelectedCity}`);
-    return userSelectedCity;
+    console.log(`✅ 使用用户选择的城市: ${userSelectedCity}`);
+    return { type: 'district_id', value: userSelectedCity };
   }
-
-  // 检查本地存储中是否有保存的城市偏好
-  const savedCity = localStorage.getItem('preferred_city');
-  if (savedCity) {
-    console.log(`💾 使用本地存储的城市偏好: ${savedCity}`);
-    userSelectedCity = savedCity;
-    return savedCity;
+  
+  // 2. 检查本地存储的位置信息（24小时内有效）
+  const storedLocation = localStorage.getItem('preferred_location');
+  const storedLocationType = localStorage.getItem('preferred_location_type');
+  const lastLocationTime = localStorage.getItem('last_location_time');
+  
+  if (storedLocation && storedLocationType && lastLocationTime) {
+    const timeDiff = Date.now() - parseInt(lastLocationTime);
+    const isValid = timeDiff < 24 * 60 * 60 * 1000; // 24小时
+    
+    if (isValid) {
+      console.log(`✅ 使用本地存储的位置信息: ${storedLocation} (类型: ${storedLocationType}, ${Math.round(timeDiff / (60 * 60 * 1000))}小时前)`);
+      return { type: storedLocationType as 'location' | 'district_id', value: storedLocation };
+    } else {
+      console.log('⏰ 本地存储的位置信息已过期，清除缓存');
+      localStorage.removeItem('preferred_location');
+      localStorage.removeItem('preferred_location_type');
+      localStorage.removeItem('last_location_time');
+    }
   }
-
+  
+  // 3. 尝试GPS定位
+  console.log('📍 尝试GPS定位...');
   return new Promise((resolve) => {
     // 检查浏览器是否支持地理位置
     if (!navigator.geolocation) {
-      console.warn('⚠️ 浏览器不支持地理位置服务');
-      console.log('🔄 尝试使用IP定位作为备选方案...');
-      getLocationByIP().then(resolve);
+      console.warn('❌ 浏览器不支持地理位置，尝试IP定位...');
+      getLocationByIP().then(districtCode => resolve({ type: 'district_id', value: districtCode }));
       return;
     }
 
@@ -203,7 +322,7 @@ async function getCurrentDistrictId(): Promise<string> {
     // 设置外部超时，确保不会无限等待
     const timeoutId = setTimeout(() => {
       console.warn('⏰ 地理位置获取超时，尝试IP定位...');
-      getLocationByIP().then(resolve);
+      getLocationByIP().then(districtCode => resolve({ type: 'district_id', value: districtCode }));
     }, 10000); // 10秒外部超时
     
     navigator.geolocation.getCurrentPosition(
@@ -217,23 +336,17 @@ async function getCurrentDistrictId(): Promise<string> {
           console.warn(`⚠️ 定位精度较低 (${accuracy}米)，可能影响天气数据准确性`);
         }
         
-        try {
-          // 使用逆地理编码获取行政区划代码
-          const districtCode = await getDistrictCodeByLocation(latitude, longitude);
-          console.log(`✅ 成功获取行政区划代码: ${districtCode}`);
-          
-          // 保存到本地存储，包含时间戳和精度信息
-          localStorage.setItem('preferred_city', districtCode);
-          localStorage.setItem('last_location_time', Date.now().toString());
-          localStorage.setItem('last_location_accuracy', accuracy.toString());
-          
-          resolve(districtCode);
-        } catch (error) {
-          console.error('❌ 逆地理编码失败:', error);
-          console.log('🔄 尝试使用IP定位作为备选方案...');
-          const fallbackCode = await getLocationByIP();
-          resolve(fallbackCode);
-        }
+        // 直接使用经纬度，不需要逆地理编码
+        const locationValue = `${longitude},${latitude}`;
+        console.log(`✅ 使用经纬度获取天气: ${locationValue}`);
+        
+        // 保存到本地存储，包含时间戳和精度信息
+        localStorage.setItem('preferred_location', locationValue);
+        localStorage.setItem('preferred_location_type', 'location');
+        localStorage.setItem('last_location_time', Date.now().toString());
+        localStorage.setItem('last_location_accuracy', accuracy.toString());
+        
+        resolve({ type: 'location', value: locationValue });
       },
       async (error) => {
         clearTimeout(timeoutId);
@@ -252,8 +365,6 @@ async function getCurrentDistrictId(): Promise<string> {
         // 根据错误类型提供不同的处理策略
         if (error.code === 1) {
           console.log('🔒 用户拒绝位置权限，建议提供城市选择界面');
-          // 可以在这里触发城市选择界面
-          // showCitySelector();
         } else if (error.code === 2) {
           console.log('📍 位置服务不可用，可能是设备或网络问题');
         } else if (error.code === 3) {
@@ -262,7 +373,7 @@ async function getCurrentDistrictId(): Promise<string> {
         
         console.log('🔄 尝试使用IP定位作为备选方案...');
         const fallbackCode = await getLocationByIP();
-        resolve(fallbackCode);
+        resolve({ type: 'district_id', value: fallbackCode });
       },
       {
         enableHighAccuracy: false, // 优先考虑速度而非精度，提升用户体验
@@ -271,6 +382,25 @@ async function getCurrentDistrictId(): Promise<string> {
       }
     );
   });
+}
+
+/**
+ * 获取当前用户的行政区划ID（向后兼容）
+ * @deprecated 建议使用 getCurrentLocationInfo() 获取更准确的位置信息
+ */
+export async function getCurrentDistrictId(): Promise<string> {
+  const locationInfo = await getCurrentLocationInfo();
+  if (locationInfo.type === 'district_id') {
+    return locationInfo.value;
+  }
+  // 如果是经纬度，需要转换为行政区划代码（作为备选方案）
+  try {
+    const [longitude, latitude] = locationInfo.value.split(',').map(Number);
+    return await getDistrictCodeByLocation(latitude, longitude);
+  } catch (error) {
+    console.error('❌ 经纬度转换行政区划代码失败:', error);
+    return '110100'; // 默认北京
+  }
 }
 
 /**
@@ -301,10 +431,18 @@ export async function getWeather(): Promise<WeatherData> {
   console.log('API_KEY:', API_KEY ? '已配置' : '未配置');
   
   try {
-    const districtId = await getCurrentDistrictId();
-    console.log(`使用行政区划ID: ${districtId}`);
+    const locationInfo = await getCurrentLocationInfo();
+    console.log(`使用位置信息: ${locationInfo.value} (类型: ${locationInfo.type})`);
     
-    const url = `${API_URL}?district_id=${districtId}&data_type=all&ak=${API_KEY}`;
+    let url: string;
+    if (locationInfo.type === 'location') {
+      // 使用经纬度
+      url = `${API_URL}?location=${locationInfo.value}&data_type=all&ak=${API_KEY}`;
+    } else {
+      // 使用行政区划ID
+      url = `${API_URL}?district_id=${locationInfo.value}&data_type=all&ak=${API_KEY}`;
+    }
+    
     console.log(`请求URL: ${url}`);
     
     console.log('发送网络请求...');
